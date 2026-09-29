@@ -441,6 +441,10 @@ Two practical consequences:
   logs, which typically have wider access and longer retention than an operator expects. Redirect
   it deliberately if that matters to you.
 
+## Revisions
+
+2026-10-01 - Initial release.
+
 ## Notices
 
 Customers are responsible for making their own independent assessment of the information in this
@@ -449,6 +453,10 @@ offerings and practices, which are subject to change without notice, and (c) doe
 commitments or assurances from AWS and its affiliates, suppliers, or licensors. AWS products or
 services are provided "as is" without warranties, representations, or conditions of any kind,
 whether express or implied.
+
+## Authors
+
+Prasanth Gutha
 
 ## License
 
