@@ -122,6 +122,221 @@ def _run(check, ctx):
 
 
 # ---- tests ---------------------------------------------------------------------------
+class TestStaleControlTargets(unittest.TestCase):
+    """A control left pointing at a deleted OU. The drift check walks existing OUs and asks
+    what is enabled on each, so it structurally cannot see this."""
+
+    OU_LIVE = "arn:aws:organizations::111111111111:ou/o-abc/ou-live-1111"
+    OU_GONE = "arn:aws:organizations::111111111111:ou/o-abc/ou-gone-9999"
+
+    def _orgs(self):
+        return FakeClient({
+            "list_roots": {"Roots": [{"Id": "r-root"}]},
+            "list_organizational_units_for_parent": lambda ParentId=None, **k: {
+                "OrganizationalUnits": [{"Id": "ou-live-1111", "Arn": self.OU_LIVE,
+                                         "Name": "Live"}] if ParentId == "r-root" else []},
+        })
+
+    def _ctx(self, controls, err=None):
+        ct_client = FakeClient(
+            {"list_enabled_controls": {"enabledControls": controls}},
+            errors={"list_enabled_controls": err} if err else None)
+        return make_ctx({"organizations": self._orgs(), "controltower": ct_client})
+
+    def test_control_on_deleted_ou_warns(self):
+        ctx = self._ctx([
+            {"targetIdentifier": self.OU_GONE,
+             "controlIdentifier": "arn:aws:controltower:us-east-1::control/AWS-GR_X",
+             "statusSummary": {"status": "SUCCEEDED"}}])
+        rpt = _run(ct.check_stale_control_targets, ctx)
+        self.assertIn(ct.WARNING, levels(rpt))
+        row = [f for f in rpt.findings if f.level == ct.WARNING][0].rows[0]
+        self.assertEqual(row[0], "ou-gone-9999")
+        self.assertEqual(row[1], "AWS-GR_X")
+
+    def test_control_on_live_ou_passes(self):
+        ctx = self._ctx([
+            {"targetIdentifier": self.OU_LIVE,
+             "controlIdentifier": "arn:aws:controltower:us-east-1::control/AWS-GR_X",
+             "statusSummary": {"status": "SUCCEEDED"}}])
+        self.assertIn(ct.PASS, levels(_run(ct.check_stale_control_targets, ctx)))
+
+    def test_account_target_is_not_treated_as_stale(self):
+        # Controls can target an account. An account ARN is not an OU ARN and must not be
+        # compared against the OU set, or every account-targeted control would be flagged.
+        ctx = self._ctx([
+            {"targetIdentifier": "arn:aws:organizations::111111111111:account/o-abc/333333333333",
+             "controlIdentifier": "arn:aws:controltower:us-east-1::control/AWS-GR_X",
+             "statusSummary": {"status": "SUCCEEDED"}}])
+        lv = levels(_run(ct.check_stale_control_targets, ctx))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.WARNING, lv)
+
+    def test_no_controls_passes(self):
+        self.assertIn(ct.PASS, levels(_run(ct.check_stale_control_targets, self._ctx([]))))
+
+    def test_api_failure_is_unknown_not_pass(self):
+        ctx = self._ctx([], err=client_error("AccessDeniedException", "ListEnabledControls"))
+        lv = levels(_run(ct.check_stale_control_targets, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
+
+class TestLogArchiveBucketState(unittest.TestCase):
+    """S3 state on the Control Tower logging buckets, per configuration-updates.html and two
+    Sev-2 cases. Requester Pays is a documented precondition; Object Lock with a retention rule
+    breaks AWS Config delivery; an unmanaged bucket makes the logging StackSet fail
+    AlreadyExists."""
+
+    CFN_TAG = [{"Key": "aws:cloudformation:stack-name", "Value": "StackSet-x"}]
+
+    def _s3(self, buckets, payer=None, lock=None, tags=None, location=None):
+        payer = payer or {}
+        lock = lock or {}
+        tags = tags or {}
+        location = location or {}
+
+        def _payment(Bucket=None, **k):
+            return {"Payer": payer.get(Bucket, "BucketOwner")}
+
+        def _lock(Bucket=None, **k):
+            if Bucket not in lock:
+                raise client_error("ObjectLockConfigurationNotFoundError",
+                          "GetObjectLockConfiguration")
+            return {"ObjectLockConfiguration": lock[Bucket]}
+
+        def _tagging(Bucket=None, **k):
+            if Bucket not in tags:
+                raise client_error("NoSuchTagSet", "GetBucketTagging")
+            return {"TagSet": tags[Bucket]}
+
+        return FakeClient({
+            "list_buckets": {"Buckets": [{"Name": b} for b in buckets]},
+            "get_bucket_location": lambda Bucket=None, **k: {
+                "LocationConstraint": location.get(Bucket)},
+            "get_bucket_request_payment": _payment,
+            "get_object_lock_configuration": _lock,
+            "get_bucket_tagging": _tagging,
+        })
+
+    def _run_with(self, s3, **over):
+        ctx = make_ctx(**over)
+        ctx.assume = lambda a, r, s: s3
+        return _run(ct.check_log_archive_bucket_state, ctx)
+
+    def test_healthy_buckets_pass(self):
+        s3 = self._s3(["aws-controltower-logs-555555555555-us-east-1"],
+                      tags={"aws-controltower-logs-555555555555-us-east-1": self.CFN_TAG})
+        self.assertIn(ct.PASS, levels(self._run_with(s3)))
+
+    def test_requester_pays_is_blocker(self):
+        # configuration-updates.html: "You must turn off that feature before you begin the
+        # Update or Reset process." A precondition, so it gates rather than warns.
+        b = "aws-controltower-logs-555555555555-us-east-1"
+        s3 = self._s3([b], payer={b: "Requester"}, tags={b: self.CFN_TAG})
+        rpt = self._run_with(s3)
+        self.assertIn(ct.BLOCKER, levels(rpt))
+        row = [f for f in rpt.findings if f.level == ct.BLOCKER][0].rows[0]
+        self.assertIn("Requester Pays", row[2])
+
+    def test_object_lock_with_retention_rule_is_blocker(self):
+        # AWS Config cannot deliver to a bucket with a default retention rule, so the Config
+        # delivery channel fails with InsufficientDeliveryPolicyException.
+        b = "aws-controltower-config-logs-555555555555-abc"
+        s3 = self._s3([b], lock={b: {"ObjectLockEnabled": "Enabled",
+                                     "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE",
+                                                                   "Days": 1825}}}})
+        rpt = self._run_with(s3)
+        self.assertIn(ct.BLOCKER, levels(rpt))
+
+    def test_object_lock_without_rule_is_warning_not_blocker(self):
+        # The flag alone does not break delivery, but it cannot be turned off again.
+        b = "aws-controltower-config-logs-555555555555-abc"
+        s3 = self._s3([b], lock={b: {"ObjectLockEnabled": "Enabled"}})
+        lv = levels(self._run_with(s3))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_missing_cfn_tag_on_stackset_bucket_warns(self):
+        # A bucket the logging StackSet creates should carry CloudFormation's automatic tags.
+        b = "aws-controltower-s3-access-logs-555555555555-us-east-1"
+        s3 = self._s3([b])                      # no tags at all
+        rpt = self._run_with(s3)
+        self.assertIn(ct.WARNING, levels(rpt))
+        self.assertNotIn(ct.BLOCKER, levels(rpt))
+
+    def test_missing_cfn_tag_on_non_stackset_bucket_is_not_flagged(self):
+        # False-positive guard. Control Tower creates the config buckets outside CloudFormation,
+        # so their lack of a stack tag is normal and must not be reported.
+        b = "aws-controltower-config-logs-555555555555-abc"
+        s3 = self._s3([b])
+        lv = levels(self._run_with(s3))
+        self.assertNotIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+        self.assertIn(ct.PASS, lv)
+
+    def test_bucket_outside_home_region_is_queried_in_its_own_region(self):
+        # get_bucket_location returns the real region; querying the wrong endpoint would make
+        # the check report UNKNOWN instead of seeing the problem.
+        b = "aws-controltower-logs-555555555555-eu-west-1"
+        s3 = self._s3([b], payer={b: "Requester"}, tags={b: self.CFN_TAG},
+                      location={b: "eu-west-1"})
+        seen = []
+
+        ctx = make_ctx()
+        ctx.assume = lambda a, r, s: (seen.append(r), s3)[1]
+        rpt = _run(ct.check_log_archive_bucket_state, ctx)
+        self.assertIn(ct.BLOCKER, levels(rpt))
+        self.assertIn("eu-west-1", seen)
+
+    def test_no_log_archive_account_is_unknown(self):
+        ctx = make_ctx(log_archive_account=None)
+        self.assertIn(ct.UNKNOWN, levels(_run(ct.check_log_archive_bucket_state, ctx)))
+
+    def test_centralized_logging_disabled_is_info_not_unknown(self):
+        # On 4.0 the integration is optional. Disabled means there is no logging bucket at all,
+        # so the check is not applicable and must not gate the run. Caught on a real 4.0 landing
+        # zone that has centralizedLogging disabled: reporting UNKNOWN there turned a clean
+        # exit 0 into exit 2.
+        ctx = make_ctx(log_archive_account=None,
+                       manifest={"centralizedLogging": {"enabled": False}})
+        lv = levels(_run(ct.check_log_archive_bucket_state, ctx))
+        self.assertIn(ct.INFO, lv)
+        self.assertNotIn(ct.UNKNOWN, lv)
+
+    def test_absent_enabled_flag_is_not_treated_as_disabled(self):
+        # Pre-4.0 manifests omit the flag entirely. Absent must not read as disabled, or the
+        # check would silently skip on every older landing zone.
+        ctx = make_ctx(log_archive_account=None, manifest={"centralizedLogging": {}})
+        self.assertIn(ct.UNKNOWN, levels(_run(ct.check_log_archive_bucket_state, ctx)))
+
+    def test_assume_failure_is_unknown_not_pass(self):
+        ctx = make_ctx()
+
+        def _boom(a, r, s):
+            raise client_error("AccessDenied", "AssumeRole")
+        ctx.assume = _boom
+        lv = levels(_run(ct.check_log_archive_bucket_state, ctx))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
+    def test_no_ct_buckets_is_unknown_not_pass(self):
+        # An empty result means the account id is wrong or the role cannot see the buckets.
+        # Reporting PASS there would be the worst outcome.
+        s3 = self._s3([])
+        lv = levels(self._run_with(s3))
+        self.assertIn(ct.UNKNOWN, lv)
+        self.assertNotIn(ct.PASS, lv)
+
+    def test_unrelated_buckets_are_ignored(self):
+        s3 = self._s3(["my-app-data", "aws-controltower-logs-555555555555-us-east-1"],
+                      payer={"my-app-data": "Requester"},
+                      tags={"aws-controltower-logs-555555555555-us-east-1": self.CFN_TAG})
+        lv = levels(self._run_with(s3))
+        self.assertIn(ct.PASS, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+
 class TestBlockerPaths(unittest.TestCase):
 
     # 1. LZ status -----------------------------------------------------------------
@@ -1025,6 +1240,56 @@ class TestBlockerPaths(unittest.TestCase):
             self.assertTrue(url.startswith(base), f"{cid} -> {url}")
             self.assertTrue(url.endswith(".html"), f"{cid} -> {url}")
 
+    # foundational OU must not be nested (CT rejects this during 4.0 input validation) -------------
+    def _found_ctx(self, ou_parent_type, ou_parent_id="ou-grandparent", lz=None):
+        orgs = FakeClient({
+            "list_parents": lambda ChildId=None, **k: (
+                {"Parents": [{"Id": "ou-hub", "Type": "ORGANIZATIONAL_UNIT"}]}
+                if ChildId in ("444444444444", "555555555555")
+                else {"Parents": [{"Id": ou_parent_id, "Type": ou_parent_type}]}
+                if ChildId == "ou-hub" else {"Parents": []}),
+        })
+        ctx = make_ctx({"organizations": orgs}, **({"lz": lz} if lz else {}))
+        ctx.all_ou_arns = lambda: [{"Id": "ou-hub", "Arn": "arn", "Name": "Foundational"}]
+        return ctx
+
+    V4_DEPLOYED = {"status": "ACTIVE", "version": "4.0", "latestAvailableVersion": "4.0",
+                   "driftStatus": {"status": "IN_SYNC"}}
+
+    def test_foundational_ou_nested_blocks_when_v4_is_deployed(self):
+        rpt = _run(ct.check_foundational_ou_not_nested,
+                   self._found_ctx("ORGANIZATIONAL_UNIT", lz=self.V4_DEPLOYED))
+        self.assertIn(ct.BLOCKER, levels(rpt))
+        f = [x for x in rpt.findings if x.check == "foundational_ou_nested"][0]
+        self.assertEqual([["Foundational", "ou-hub", "ou-grandparent"]], f.rows)
+
+    def test_foundational_ou_nested_only_warns_when_v4_merely_available(self):
+        """CT gates the validation on the DEPLOYED version, so a 3.x landing zone is not
+        rejected - not even by the update that takes it to 4.0."""
+        rpt = _run(ct.check_foundational_ou_not_nested, self._found_ctx("ORGANIZATIONAL_UNIT"))
+        self.assertIn(ct.WARNING, levels(rpt))
+        self.assertNotIn(ct.BLOCKER, levels(rpt))
+
+    def test_foundational_ou_directly_under_root_passes(self):
+        rpt = _run(ct.check_foundational_ou_not_nested, self._found_ctx("ROOT", "r-abcd"))
+        self.assertIn(ct.PASS, levels(rpt))
+        self.assertNotIn(ct.BLOCKER, levels(rpt))
+
+    def test_foundational_ou_check_skipped_before_v4(self):
+        pre4 = {"status": "ACTIVE", "version": "3.2", "latestAvailableVersion": "3.3",
+                "driftStatus": {"status": "IN_SYNC"}}
+        rpt = _run(ct.check_foundational_ou_not_nested,
+                   self._found_ctx("ORGANIZATIONAL_UNIT", lz=pre4))
+        self.assertEqual({ct.INFO}, levels(rpt))
+
+    def test_foundational_ou_unresolvable_is_not_a_pass(self):
+        orgs = FakeClient({}, {"list_parents":
+                               client_error("AccessDeniedException", "ListParents")})
+        ctx = make_ctx({"organizations": orgs})
+        lv = levels(_run(ct.check_foundational_ou_not_nested, ctx))
+        self.assertNotIn(ct.PASS, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
     def test_render_includes_doc_reference(self):
         rpt = ct.Report()
         rpt.add(ct.Finding("lz_status", ct.BLOCKER, "Landing zone is in a FAILED state"))
@@ -1178,12 +1443,106 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertIn(ct.PASS, lv)
         self.assertNotIn(ct.WARNING, lv)
 
-    def test_scp_deny_all_actions_still_warns(self):
-        # Action "*" denies everything, including what CT needs. It cannot be dismissed by
-        # intersecting service prefixes, so it must stay a warning.
+    @staticmethod
+    def _scp_orgs_ous(content, attach_to, shared_parent="ou-sec"):
+        """Org with two OUs where the custom SCP is attached only to `attach_to`.
+
+        list_parents places the shared accounts under `shared_parent`, so a test can put the
+        SCP on the OU that holds them or on an unrelated one.
+        """
+        full = {"Name": "FullAWSAccess", "Id": "p-Full", "AwsManaged": True}
+        custom = {"Name": "custom", "Id": "p-x", "AwsManaged": False}
+        ous = {
+            "r-root": [{"Id": "ou-sec", "Arn": "arn:ou-sec", "Name": "Security"},
+                       {"Id": "ou-other", "Arn": "arn:ou-other", "Name": "Sandbox"}],
+        }
+        return FakeClient({
+            "list_roots": {"Roots": [{"Id": "r-root", "Name": "Root"}]},
+            "list_organizational_units_for_parent":
+                lambda ParentId=None, **k: {"OrganizationalUnits": ous.get(ParentId, [])},
+            "list_policies_for_target": lambda TargetId=None, **k: {
+                "Policies": [full, custom] if TargetId == attach_to else [full]},
+            "describe_policy": lambda PolicyId=None, **k: {
+                "Policy": {"Content": content if PolicyId == "p-x" else "{}"}},
+            "list_parents": lambda ChildId=None, **k: {
+                "Parents": [{"Id": shared_parent, "Type": "ORGANIZATIONAL_UNIT"}]},
+        })
+
+    def test_scp_total_deny_at_root_blocks(self):
+        # Deny Action "*" on Resource "*" with no condition, attached to the root, reaches every
+        # member account including Log Archive and Audit. Organizations is explicit that an SCP
+        # denies the action there even for a role holding AdministratorAccess, and that only
+        # service-linked roles are exempt - AWSControlTowerExecution is not one. The update does
+        # its work in those accounts through that role, so this is a hard block, not a heuristic.
         ctx = make_ctx({"organizations": self._scp_orgs(self._deny("*"))})
+        rpt = _run(ct.check_scp_blocking, ctx)
+        self.assertIn(ct.BLOCKER, levels(rpt))
+        blocker = [f for f in rpt.findings if f.level == ct.BLOCKER][0]
+        self.assertIn("every action on every resource", blocker.rows[0][2])
+
+    def test_scp_total_deny_on_shared_account_ou_blocks(self):
+        # Same statement attached to the OU that actually holds the shared accounts.
+        ctx = make_ctx({"organizations": self._scp_orgs_ous(self._deny("*"), attach_to="ou-sec")})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_scp_blocking, ctx)))
+
+    def test_scp_total_deny_on_unrelated_ou_warns_not_blocks(self):
+        # A total deny on an OU with no shared account cannot stop the landing zone update,
+        # which operates on the management and shared accounts. Still worth reporting, but not
+        # as a blocker - grading it otherwise would fail upgrades that would have succeeded.
+        ctx = make_ctx({"organizations": self._scp_orgs_ous(self._deny("*"),
+                                                           attach_to="ou-other")})
         lv = levels(_run(ct.check_scp_blocking, ctx))
         self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_scp_total_deny_with_condition_warns_not_blocks(self):
+        # A Condition may exempt Control Tower by a means the tool cannot evaluate, so the
+        # statement is no longer unambiguous and drops back to the heuristic path.
+        content = self._deny("*", {"StringNotEquals": {"aws:PrincipalTag/team": "platform"}})
+        ctx = make_ctx({"organizations": self._scp_orgs(content)})
+        lv = levels(_run(ct.check_scp_blocking, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_scp_total_deny_with_ct_exemption_does_not_block(self):
+        # An explicit AWSControlTowerExecution exemption is the documented remediation, so a
+        # total deny carrying one must not be graded a blocker.
+        content = self._deny("*", {"ArnNotLike": {
+            "aws:PrincipalARN": "arn:aws:iam::*:role/AWSControlTowerExecution"}})
+        ctx = make_ctx({"organizations": self._scp_orgs(content)})
+        self.assertNotIn(ct.BLOCKER, levels(_run(ct.check_scp_blocking, ctx)))
+
+    def test_scp_total_deny_list_form_blocks(self):
+        # "Action": ["*"] is the same statement written as a list.
+        content = json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Deny", "Action": ["*"], "Resource": ["*"]}]})
+        ctx = make_ctx({"organizations": self._scp_orgs(content)})
+        self.assertIn(ct.BLOCKER, levels(_run(ct.check_scp_blocking, ctx)))
+
+    def test_scp_notresource_deny_warns_not_blocks(self):
+        # NotResource inverts the resource set, so the statement is not a total deny.
+        content = json.dumps({"Version": "2012-10-17", "Statement": [
+            {"Effect": "Deny", "Action": "*", "NotResource": "arn:aws:s3:::allowed/*"}]})
+        ctx = make_ctx({"organizations": self._scp_orgs(content)})
+        lv = levels(_run(ct.check_scp_blocking, ctx))
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+
+    def test_unconditional_total_deny_helper(self):
+        # The predicate decides a BLOCKER, so pin its exact contract.
+        f = ct._is_unconditional_total_deny
+        self.assertTrue(f({"Effect": "Deny", "Action": "*", "Resource": "*"}))
+        self.assertTrue(f({"Effect": "Deny", "Action": ["*"], "Resource": ["*"]}))
+        self.assertTrue(f({"Effect": "Deny", "Action": " * ", "Resource": "*"}))
+        # Not total, or not evaluable:
+        self.assertFalse(f({"Effect": "Allow", "Action": "*", "Resource": "*"}))
+        self.assertFalse(f({"Effect": "Deny", "Action": "s3:*", "Resource": "*"}))
+        self.assertFalse(f({"Effect": "Deny", "Action": "*", "Resource": "arn:aws:s3:::b/*"}))
+        self.assertFalse(f({"Effect": "Deny", "Action": "*"}))  # Resource absent
+        self.assertFalse(f({"Effect": "Deny", "NotAction": "s3:*", "Resource": "*"}))
+        self.assertFalse(f({"Effect": "Deny", "Action": "*", "NotResource": "arn:x"}))
+        self.assertFalse(f({"Effect": "Deny", "Action": "*", "Resource": "*",
+                            "Condition": {"StringEquals": {"aws:PrincipalTag/x": "y"}}}))
 
     def test_scp_notaction_deny_still_warns(self):
         # NotAction is inverted - it denies everything EXCEPT what it lists - so the same

@@ -180,11 +180,13 @@ _CHECK_DOCS = {
     "controls_drift": f"{DOC}/resolving-drift.html",
     "baselines_drift": f"{DOC}/resolve-drift.html",
     "stale_baseline_targets": f"{DOC}/troubleshooting.html",
+    "stale_control_targets": f"{DOC}/remove-ou.html",
     "foundational_ou": f"{DOC}/drift.html",
     "foundational_ou_placement": f"{DOC}/drift.html",
     "foundational_ou_extra_accounts": f"{DOC}/drift.html",
     "foundational_ou_additional": f"{DOC}/drift.html",
     "governed_regions": f"{DOC}/region-how.html",
+    "foundational_ou_nested": f"{DOC}/key-changes-lz-v4.html",
     "stacksets": f"{DOC}/drift.html",
     "stacksets_member": f"{DOC}/drift.html",
     "stacksets_expected": f"{DOC}/drift.html",
@@ -195,6 +197,7 @@ _CHECK_DOCS = {
     "stackset_drift_orphaned": f"{DOC}/shared-account-resources.html",
     "stackset_ops": f"{DOC}/troubleshooting.html",
     "config_shared": f"{DOC}/existing-config-resources.html",
+    "log_archive_buckets": f"{DOC}/configuration-updates.html",
     "customizations": f"{DOC}/configuration-updates.html",
     "trusted_access": f"{DOC}/governance-drift.html",
     "delegated_admins": f"{DOC}/governance-drift.html",
@@ -1516,6 +1519,183 @@ def check_config_in_shared_accounts(ctx: Context, report: Report) -> None:
                            "Audit/Log Archive shared accounts"))
 
 
+_CT_BUCKET_PREFIX = "aws-controltower-"
+
+# Buckets the AWSControlTowerLoggingResources StackSet creates, so CloudFormation owns them
+# and they carry its automatic aws:cloudformation:* tags. Control Tower creates other
+# aws-controltower-* buckets outside CloudFormation, so the unmanaged-bucket test is confined
+# to these two families to avoid flagging a healthy landing zone.
+_CFN_MANAGED_BUCKET_PREFIXES = (
+    "aws-controltower-logs-",
+    "aws-controltower-s3-access-logs-",
+)
+
+
+def check_log_archive_bucket_state(ctx: Context, report: Report) -> None:
+    """S3 state on the Control Tower logging buckets that blocks an update or reset.
+
+    Three conditions, each with its own severity:
+
+    - Requester Pays, a documented hard prerequisite. configuration-updates.html:
+      "Before you update or reset your landing zone, be sure that the Amazon S3 logging
+      bucket for the Log Archive account does not have the Requester Pays feature enabled.
+      You must turn off that feature before you begin the Update or Reset process."
+      Graded BLOCKER, because the documentation makes it a precondition rather than a risk.
+
+    - S3 Object Lock carrying a default retention rule. AWS Config cannot deliver to such a
+      bucket, so the delivery channel fails with InsufficientDeliveryPolicyException and the
+      Config baseline stack fails with it. Graded BLOCKER: the failure is in the baseline
+      the update deploys. Object Lock with the flag on but no default retention rule is a
+      WARNING instead - it does not break delivery, but the flag cannot be turned off again,
+      which blocks using the bucket as an access-logging destination and means a later reset
+      can collide on the persisted bucket name.
+
+    - A CloudFormation-managed logging bucket that carries no CloudFormation stack tag. If
+      the bucket exists outside the StackSet's control, the StackSet fails with AlreadyExists
+      when it tries to create it. CloudFormation applies aws:cloudformation:* tags to the
+      resources it creates automatically, so their absence is the available signal - but tags
+      can also be removed by hand, so this is a WARNING to verify, not a blocker.
+
+    Read-only throughout. Requires the precheck role in the Log Archive account; without it
+    the check reports UNKNOWN rather than silently passing.
+    """
+    # On landing zone 4.0+ the CentralizedLogging integration is optional. When it is
+    # explicitly disabled there is no Log Archive account and no Control Tower logging
+    # bucket, so there is nothing to verify - that is "not applicable", not "unverified",
+    # and must not gate the run. An absent flag is not a disabled flag: earlier manifests
+    # omit it entirely, so only an explicit False skips the check.
+    if _integration_enabled(ctx, "centralizedLogging") is False:
+        report.add(Finding("log_archive_buckets", INFO,
+                           "CentralizedLogging integration is disabled, so there is no Control "
+                           "Tower logging bucket to check"))
+        return
+
+    acct = ctx.log_archive_account
+    if not acct:
+        report.add(Finding("log_archive_buckets", UNKNOWN,
+                           "Could not determine the Log Archive account id; skipped the S3 "
+                           "logging-bucket checks",
+                           "The account id comes from the landing-zone manifest. The "
+                           "CentralizedLogging integration is enabled (or its state is not "
+                           "stated), so the logging buckets should exist and could not be "
+                           "verified.",
+                           remediation="Pass --log-archive-account to force it."))
+        return
+
+    try:
+        s3_home = ctx.assume(acct, ctx.region, "s3")
+        buckets = [b["Name"] for b in s3_home.list_buckets().get("Buckets", [])
+                   if str(b.get("Name", "")).startswith(_CT_BUCKET_PREFIX)]
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("log_archive_buckets", UNKNOWN,
+                           "Could not list S3 buckets in the Log Archive account", str(e),
+                           remediation=f"Grant the precheck --member-role in {acct} with "
+                                       "s3:ListAllMyBuckets, or verify manually that Requester "
+                                       "Pays is off and Object Lock is not enabled on the "
+                                       "Control Tower logging buckets."))
+        return
+
+    if not buckets:
+        report.add(Finding("log_archive_buckets", UNKNOWN,
+                           "No aws-controltower-* buckets found in the Log Archive account",
+                           "A landing zone normally has at least one. Either the account id is "
+                           "wrong or the buckets are not visible to the precheck role.",
+                           remediation="Confirm the Log Archive account id and the role's "
+                                       "s3:ListAllMyBuckets permission."))
+        return
+
+    blockers: List[List[str]] = []
+    warnings: List[List[str]] = []
+    skipped: List[List[str]] = []
+    clients: Dict[str, Any] = {ctx.region: s3_home}
+
+    for name in sorted(buckets):
+        try:
+            loc = s3_home.get_bucket_location(Bucket=name).get("LocationConstraint")
+            region = loc or "us-east-1"          # the API returns None for us-east-1
+            if region not in clients:
+                clients[region] = ctx.assume(acct, region, "s3")
+            s3 = clients[region]
+        except (ClientError, BotoCoreError) as e:
+            skipped.append([name, _error_code(e), _skip_note(e)])
+            continue
+
+        try:
+            payer = s3.get_bucket_request_payment(Bucket=name).get("Payer")
+            if payer == "Requester":
+                blockers.append([name, region, "Requester Pays is enabled"])
+        except (ClientError, BotoCoreError) as e:
+            skipped.append([name, _error_code(e), _skip_note(e)])
+
+        try:
+            olc = s3.get_object_lock_configuration(Bucket=name).get(
+                "ObjectLockConfiguration", {})
+            if olc.get("ObjectLockEnabled") == "Enabled":
+                if olc.get("Rule"):
+                    blockers.append([name, region,
+                                     "Object Lock enabled with a default retention rule"])
+                else:
+                    warnings.append([name, region,
+                                     "Object Lock enabled (no default retention rule)"])
+        except (ClientError, BotoCoreError) as e:
+            # Not enabled is reported as an error condition, which is the healthy case.
+            if _error_code(e) not in ("ObjectLockConfigurationNotFoundError",):
+                skipped.append([name, _error_code(e), _skip_note(e)])
+
+        if name.startswith(_CFN_MANAGED_BUCKET_PREFIXES):
+            try:
+                tags = {t["Key"] for t in
+                        s3.get_bucket_tagging(Bucket=name).get("TagSet", [])}
+                if not any(k.startswith("aws:cloudformation:") for k in tags):
+                    warnings.append([name, region,
+                                     "No aws:cloudformation:* tag, so it may exist outside "
+                                     "StackSet control"])
+            except (ClientError, BotoCoreError) as e:
+                if _error_code(e) in ("NoSuchTagSet", "NoSuchTagSetError"):
+                    warnings.append([name, region,
+                                     "No tags at all, so it may exist outside StackSet control"])
+                else:
+                    skipped.append([name, _error_code(e), _skip_note(e)])
+
+    _report_partial_scope(report, "log_archive_buckets", "Log Archive bucket(s)", skipped)
+
+    if blockers:
+        report.add(Finding("log_archive_buckets", BLOCKER,
+                           f"{len(blockers)} Control Tower logging bucket(s) in a state that "
+                           "blocks an update",
+                           "Requester Pays must be turned off before an update or reset - the "
+                           "documentation states it as a precondition, not a risk. S3 Object "
+                           "Lock with a default retention rule stops AWS Config delivering to "
+                           "the bucket, so the Config delivery channel fails with "
+                           "InsufficientDeliveryPolicyException and the baseline stack fails "
+                           "with it.",
+                           cols=["Bucket", "Region", "Problem"], rows=blockers,
+                           remediation="Turn off Requester Pays on the logging bucket. For a "
+                                       "default retention rule, remove the rule with "
+                                       "PutObjectLockConfiguration (keeping ObjectLockEnabled); "
+                                       "existing locked objects stay protected. Note that "
+                                       "Control Tower treats a direct change as drift and may "
+                                       "revert it, so engage AWS Support for a durable fix."))
+    if warnings:
+        report.add(Finding("log_archive_buckets", WARNING,
+                           f"{len(warnings)} Control Tower logging bucket(s) need review",
+                           "The Object Lock flag cannot be turned off once enabled. A bucket "
+                           "carrying it cannot be a server-access-logging destination, and a "
+                           "reset reuses the persisted bucket name, so a later reset can fail "
+                           "on a name collision. A CloudFormation-created bucket with no "
+                           "aws:cloudformation:* tag may exist outside the StackSet's control, "
+                           "in which case the StackSet fails with AlreadyExists when it tries "
+                           "to create it - though the tags may simply have been removed.",
+                           cols=["Bucket", "Region", "Problem"], rows=warnings,
+                           remediation="Confirm in CloudFormation whether the bucket belongs to "
+                                       "the AWSControlTowerLoggingResources StackSet, and engage "
+                                       "AWS Support before an update if Object Lock is on."))
+    if not blockers and not warnings and not skipped:
+        report.add(Finding("log_archive_buckets", PASS,
+                           f"{len(buckets)} Control Tower logging bucket(s) checked: Requester "
+                           "Pays off, no Object Lock, CloudFormation-managed"))
+
+
 def check_customizations(ctx: Context, report: Report) -> None:
     """Detect CfCT / AFT / custom StackSets so the operator knows to prune region-scoped
     custom stack instances before a region-expanding upgrade."""
@@ -2172,6 +2352,39 @@ def _denied_action_services(stmt: dict) -> Optional[Set[str]]:
     return services
 
 
+def _is_unconditional_total_deny(stmt: dict) -> bool:
+    """True only for a Deny of every action on every resource, with no condition.
+
+    This is the one SCP shape that needs no policy simulation to judge. Organizations
+    states that an SCP "restricts permissions for IAM users and roles in member
+    accounts", that a permission denied at any level above the account cannot be used
+    "even if the account administrator attaches the AdministratorAccess IAM policy with
+    */* permissions", and that only service-linked roles are exempt. AWSControlTowerExecution
+    is not a service-linked role, so a total deny reaching a member account also denies the
+    CloudFormation, Config, S3, SNS, CloudTrail and IAM calls Control Tower makes there.
+
+    Anything narrower stays a heuristic and is reported as WARNING instead: a Condition may
+    exempt Control Tower by a means this function cannot evaluate, and NotAction/NotResource
+    invert the statement.
+    """
+    if stmt.get("Effect") != "Deny":
+        return False
+    if "NotAction" in stmt or "NotResource" in stmt:
+        return False
+    if stmt.get("Condition"):
+        return False
+
+    def _is_star(value: Any) -> bool:
+        if isinstance(value, str):
+            return value.strip() == "*"
+        if isinstance(value, (list, tuple)):
+            return any(isinstance(v, str) and v.strip() == "*" for v in value)
+        return False
+
+    # Resource is mandatory in an SCP statement; treat its absence as un-evaluable.
+    return _is_star(stmt.get("Action")) and _is_star(stmt.get("Resource"))
+
+
 def check_scp_blocking(ctx: Context, report: Report) -> None:
     """SCP *content* can block a Control Tower update, per AWS guidance:
       - The `FullAWSAccess` SCP must remain attached (its removal breaks CT access).
@@ -2197,10 +2410,25 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
     targets = [{"Id": r["Id"], "Name": f"(root) {r.get('Name', r['Id'])}"} for r in roots]
     targets += [{"Id": o["Id"], "Name": o["Name"]} for o in ous]
 
-    missing_fullaccess, risky = [], []
+    missing_fullaccess, risky, blocking = [], [], []
     doc_cache: Dict[str, Any] = {}
     skipped: List[List[str]] = []
     checked = 0
+
+    # Which attachment points can reach the accounts the update actually works in?
+    # The org root, because SCPs inherit down to every member account, and whichever OU
+    # each shared account currently sits in. A total deny anywhere else still gets
+    # reported, just not as a blocker: the landing zone update operates on the management
+    # and shared accounts, and SCPs never apply to the management account.
+    reaches_shared = {r["Id"] for r in roots}
+    for _acct in sorted({a for a in ctx.shared_accounts if a and a != ctx.mgmt_account}):
+        try:
+            for _p in _collect(ctx.orgs, "list_parents", "Parents", ChildId=_acct):
+                reaches_shared.add(_p["Id"])
+        except (ClientError, BotoCoreError) as e:
+            # Without the parent we cannot tell whether an OU holds a shared account, so a
+            # total deny on it stays WARNING. Record it so the scope is reported honestly.
+            skipped.append([f"parent OU of shared account {_acct}", _error_code(e), _skip_note(e)])
     for t in targets:
         try:
             scps = _collect(ctx.orgs, "list_policies_for_target", "Policies",
@@ -2256,7 +2484,11 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                         break
                     continue
                 if not exempts_ct:
-                    if services is None:
+                    total_deny = _is_unconditional_total_deny(stmt)
+                    if total_deny:
+                        scope = ('denies every action on every resource ("Action": "*", '
+                                 '"Resource": "*") with no condition')
+                    elif services is None:
                         scope = ("denies all actions, or uses NotAction, so it cannot be "
                                  "evaluated by action")
                     else:
@@ -2264,7 +2496,10 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                         scope = "denies " + ", ".join(f"{s}:*" for s in hit)
                     reason = (f"Deny does not exempt AWSControlTowerExecution and {scope}"
                               + ("; also restricts Regions" if restricts_region else ""))
-                    risky.append([t["Name"], name, reason])
+                    if total_deny and t["Id"] in reaches_shared:
+                        blocking.append([t["Name"], name, reason])
+                    else:
+                        risky.append([t["Name"], name, reason])
                     break  # one row per SCP/target is enough
                 elif restricts_region:
                     risky.append([t["Name"], name, "Region restriction via SCP (use CT Region deny)"])
@@ -2280,6 +2515,25 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                            "its removal can cut off access that CT needs during the update.",
                            cols=["Target"], rows=missing_fullaccess,
                            remediation="Re-attach the AWS-managed FullAWSAccess SCP to the target."))
+    if blocking:
+        report.add(Finding("scp_blocking", BLOCKER,
+                           f"{len(blocking)} SCP attachment(s) deny every action where the "
+                           "update does its work",
+                           "These SCPs deny every action on every resource, with no condition "
+                           "and no AWSControlTowerExecution exemption, and are attached to the "
+                           "organization root or to an OU holding a shared account. Control "
+                           "Tower performs the update's work in the shared accounts by assuming "
+                           "AWSControlTowerExecution and calling CloudFormation, AWS Config, "
+                           "S3, SNS, CloudTrail and IAM. An SCP denies those calls in a member "
+                           "account even when the role holds AdministratorAccess, and only "
+                           "service-linked roles are exempt - AWSControlTowerExecution is not "
+                           "one. Unlike a Deny scoped to controltower:* itself, which cannot "
+                           "interfere, this reaches the calls the update depends on.",
+                           cols=["Target", "SCP", "Risk"], rows=blocking,
+                           remediation="Detach the SCP for the duration of the upgrade, or add "
+                                       "an AWSControlTowerExecution exemption (ArnNotLike on "
+                                       "aws:PrincipalArn), or narrow it so it no longer denies "
+                                       "every action."))
     if risky:
         report.add(Finding("scp_blocking", WARNING,
                            f"{len(risky)} custom SCP attachment(s) may block Control Tower",
@@ -2297,10 +2551,72 @@ def check_scp_blocking(ctx: Context, report: Report) -> None:
                                        "aws:PrincipalArn) or detach the SCP for the upgrade. For a "
                                        "Region restriction, use the Control Tower Region deny "
                                        "control instead."))
-    if not missing_fullaccess and not risky:
+    if not missing_fullaccess and not risky and not blocking:
         report.add(Finding("scp_blocking", PASS,
                            f"FullAWSAccess present and no CT-blocking custom SCP patterns "
                            f"found across {checked} target(s){_scope_suffix(skipped)}"))
+
+
+def check_stale_control_targets(ctx: Context, report: Report) -> None:
+    """Enabled controls whose target OU no longer exists in AWS Organizations.
+
+    The sibling of check_stale_baseline_targets, and a distinct blind spot. The control
+    drift check walks the OUs that exist and asks what is enabled on each, so a control
+    left pointing at a deleted OU is never asked about and cannot be seen that way. Listing
+    enabled controls without a target identifier returns every one of them with the target
+    it holds, which is what makes the stale reference visible.
+
+    Observed: an administrator deleted an OU in Organizations without first deregistering
+    it from Control Tower; the landing zone update then failed while enabling mandatory
+    controls, with ParentNotFoundException naming the deleted OU, and the landing zone was
+    left FAILED. AWS has stated that it has since fixed the service-side handling of this
+    case, which is why it is reported as a WARNING rather than a blocker - the stale
+    reference is worth clearing before an update that does not roll back, but it is no
+    longer a demonstrated hard failure.
+    """
+    try:
+        existing = {ou["Arn"] for ou in ctx.all_ou_arns()}
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("stale_control_targets", UNKNOWN,
+                           "Could not enumerate OUs to validate control targets", str(e)))
+        return
+    try:
+        # No targetIdentifier: returns every enabled control with the target it holds,
+        # including targets that no longer exist.
+        controls = _collect(ctx.ct, "list_enabled_controls", "enabledControls")
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("stale_control_targets", UNKNOWN,
+                           "Could not list enabled controls without a target filter", str(e),
+                           remediation="Grant controltower:ListEnabledControls and re-run."))
+        return
+
+    stale = []
+    for c in controls:
+        target = str(c.get("targetIdentifier") or "")
+        # Only OU targets can go stale this way; an account target is covered elsewhere.
+        if ":ou/" not in target or target in existing:
+            continue
+        stale.append([target.rsplit("/", 1)[-1],
+                      str(c.get("controlIdentifier") or "").rsplit("/", 1)[-1],
+                      (c.get("statusSummary") or {}).get("status") or "unknown"])
+
+    if stale:
+        report.add(Finding("stale_control_targets", WARNING,
+                           f"{len(stale)} enabled control(s) target an OU that no longer exists",
+                           "Deleting an OU in Organizations without first deregistering it from "
+                           "Control Tower leaves Control Tower holding a reference to an OU that "
+                           "is gone. An update that enables mandatory controls has been seen to "
+                           "fail on exactly this, with ParentNotFoundException naming the deleted "
+                           "OU and the landing zone left FAILED. The control drift check cannot "
+                           "see these, because it asks what is enabled on each OU that exists.",
+                           cols=["Missing OU", "Control", "Status"], rows=stale,
+                           remediation=f"{DOC}/remove-ou.html - deregister an OU in Control Tower "
+                                       "before deleting it in Organizations. Clearing an existing "
+                                       "stale reference is done on the Control Tower side, so "
+                                       "engage AWS Support if an update fails on one."))
+    else:
+        report.add(Finding("stale_control_targets", PASS,
+                           "Every enabled control targets an OU that still exists"))
 
 
 def check_foundational_ou_structure(ctx: Context, report: Report) -> None:
@@ -2469,6 +2785,91 @@ def check_foundational_ou_structure(ctx: Context, report: Report) -> None:
         report.add(Finding("foundational_ou", PASS,
                            f"Shared accounts are together in one Foundational OU ({f_name}) and "
                            f"{len(additional)} other OU(s) exist{scope}"))
+
+
+def check_foundational_ou_not_nested(ctx: Context, report: Report) -> None:
+    """The OU holding the service-integration accounts must not itself be nested.
+
+    On landing zone 4.0+ Control Tower resolves the foundational OU from where the
+    service-integration accounts sit, then rejects the operation outright if that OU is nested
+    under another OU rather than sitting directly under the organization root. It also rejects
+    those accounts being left at the root - that case is check 26.
+
+    Because the rejection happens during input validation rather than mid-deployment, it is a
+    BLOCKER: the update does not start, and no partial state is left behind. Evaluated only
+    when 4.0 is deployed or available, since the requirement arrived with 4.0.
+    """
+    deployed = _lz_major_version(ctx) or 0
+    latest = _latest_major_version(ctx) or 0
+    if deployed < 4 and latest < 4:
+        report.add(Finding("foundational_ou_nested", INFO,
+                           "Nested-OU check skipped: landing zone 4.0 is neither deployed nor "
+                           "available, and the requirement arrived with 4.0"))
+        return
+    # The requirement is evaluated against the version already DEPLOYED, not the version being
+    # moved to. A 3.x landing zone therefore is not rejected at all, not even by the update that
+    # takes it to 4.0 - so a nested OU is only a hard blocker once 4.0 is deployed. Below that it
+    # is an advisory warning about the operation after this one.
+    level = BLOCKER if deployed >= 4 else WARNING
+
+    shared = {a for a in ctx.shared_accounts if a and a != ctx.mgmt_account}
+    if not shared:
+        report.add(Finding("foundational_ou_nested", UNKNOWN,
+                           "No shared accounts discovered, so the foundational OU cannot be\n"
+                           "identified",
+                           remediation="Pass --audit-account / --log-archive-account."))
+        return
+
+    found_ous, skipped = set(), []
+    for acct in sorted(shared):
+        try:
+            parents = _collect(ctx.orgs, "list_parents", "Parents", ChildId=acct)
+        except (ClientError, BotoCoreError) as e:
+            skipped.append([f"account {acct}", _error_code(e), _skip_note(e)])
+            continue
+        for par in parents:
+            if par.get("Type") == "ORGANIZATIONAL_UNIT":
+                found_ous.add(par.get("Id", ""))
+
+    nested, ou_names = [], {}
+    try:
+        ou_names = {o["Id"]: o.get("Name", o["Id"]) for o in ctx.all_ou_arns()}
+    except (ClientError, BotoCoreError):
+        pass
+    for ou in sorted(o for o in found_ous if o):
+        try:
+            gp = _collect(ctx.orgs, "list_parents", "Parents", ChildId=ou)
+        except (ClientError, BotoCoreError) as e:
+            skipped.append([f"OU {ou}", _error_code(e), _skip_note(e)])
+            continue
+        for g in gp:
+            if g.get("Type") == "ORGANIZATIONAL_UNIT":
+                nested.append([ou_names.get(ou, ou), ou,
+                               ou_names.get(g.get("Id", ""), g.get("Id", ""))])
+
+    _report_partial_scope(report, "foundational_ou_nested", "OU parent lookup(s)", skipped)
+    if nested:
+        detail = ("On landing zone 4.0+ Control Tower resolves the foundational OU from where the "
+                  "service-integration accounts sit, and rejects the operation when that OU is "
+                  "not directly under the organization root. The rejection happens during input "
+                  "validation, so the operation will not start.")
+        if level == WARNING:
+            detail += (" Reported as a warning rather than a blocker because the validation is "
+                       f"gated on the deployed version, which is {ctx.lz.get('version')}: this "
+                       "update is not affected, but operations after 4.0 is deployed will be.")
+        report.add(Finding("foundational_ou_nested", level,
+                           f"{len(nested)} foundational OU is nested under another OU",
+                           detail,
+                           cols=["Foundational OU", "OU id", "Nested under"], rows=nested,
+                           remediation="Move the OU holding the service-integration accounts so "
+                                       "that it sits directly under the organization root, or "
+                                       "move those accounts into an OU that already does."))
+    elif not found_ous:
+        report.add(Finding("foundational_ou_nested", UNKNOWN,
+                           "Could not resolve the foundational OU from the shared accounts"))
+    elif not skipped:
+        report.add(Finding("foundational_ou_nested", PASS,
+                           "The foundational OU sits directly under the organization root"))
 
 
 def check_governed_region_availability(ctx: Context, report: Report) -> None:
@@ -3159,13 +3560,16 @@ CHECKS = [
     check_enabled_controls,
     check_enabled_baselines,
     check_stale_baseline_targets,
+    check_stale_control_targets,
     check_foundational_ou_structure,
     check_governed_region_availability,
+    check_foundational_ou_not_nested,
     check_stacksets,
     check_expected_stacksets,
     check_stackset_active_drift,
     check_stackset_operations_in_progress,
     check_config_in_shared_accounts,
+    check_log_archive_bucket_state,
     check_orphaned_ct_resources,
     check_customizations,
     check_trusted_access,

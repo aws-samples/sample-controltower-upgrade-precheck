@@ -104,6 +104,9 @@ Each check maps to a documented cause of landing-zone update failure or drift.
 | 26 | Foundational OU structure | Three of the four drift types [drift.html](https://docs.aws.amazon.com/controltower/latest/userguide/drift.html) says to resolve right away. **Shared accounts split across OUs or sitting at root** (WARNING — the documented remediation is itself a landing-zone update); **a foreign account inside the Foundational OU**, which Control Tower's update validator rejects outright with *"the Security OU contains accounts other than the shared accounts"* (BLOCKER); **no Additional OU** at all, when *"at least one Additional OU is required for AWS Control Tower to operate"* (WARNING). The Foundational OU is identified by where the shared accounts live, never by name, since renaming it is permitted and on 4.0 the OU holding the service-integration accounts becomes the Security OU. The foreign-account test is skipped, and says so, when any service integration is disabled: a disabled integration names no account while its account usually still sits in that OU | `organizations:ListParents` / `ListAccountsForParent` / `ListOrganizationalUnitsForParent` | BLOCKER / WARNING / INFO |
 | 27 | Governed Region availability | A governed Region that is not enabled for this account. Observed blocking a landing-zone update. WARNING rather than BLOCKER because opt-in status is only one reason a Region can be unusable — a service-side regional event can block an update while every Region still reports enabled, and that is not visible from the account | `account:ListRegions` | WARNING |
 | 28 | CloudTrail role managed policy | Only when an upgrade into 4.0 is available: whether `AWSControlTowerCloudTrailRole` uses the AWS managed policy `AWSControlTowerCloudTrailRolePolicy` rather than the legacy inline policy, which [updating to 4.0 via the API requires](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html). Skipped when the landing zone is already 4.0+, and a missing role is left to check 13 | `iam:ListAttachedRolePolicies` | WARNING |
+| 29 | Log Archive S3 bucket state | Three conditions on the `aws-controltower-*` buckets in the Log Archive account. **Requester Pays** is a documented precondition — ["be sure that the Amazon S3 logging bucket for the Log Archive account does not have the Requester Pays feature enabled ... before you begin the Update or Reset process"](https://docs.aws.amazon.com/controltower/latest/userguide/configuration-updates.html) (BLOCKER). **S3 Object Lock with a default retention rule**, which AWS Config cannot deliver to, so the delivery channel and the Config baseline stack fail with `InsufficientDeliveryPolicyException` (BLOCKER); the flag on its own is a WARNING, since it cannot be turned off again and a reset reuses the persisted bucket name. **A logging-StackSet bucket carrying no `aws:cloudformation:*` tag**, which suggests it exists outside StackSet control and will fail `AlreadyExists` when the StackSet tries to create it (WARNING — tags can also be removed by hand). Requires the precheck role in the Log Archive account; reports UNKNOWN without it | `s3:ListAllMyBuckets` / `GetBucketLocation` / `GetBucketRequestPayment` / `GetBucketObjectLockConfiguration` / `GetBucketTagging` | BLOCKER / WARNING |
+| 30 | Control target OU still exists | An enabled control whose target OU is no longer present in AWS Organizations. Deleting an OU without first [deregistering it from Control Tower](https://docs.aws.amazon.com/controltower/latest/userguide/remove-ou.html) leaves Control Tower holding a reference to an OU that is gone; an update enabling mandatory controls has been seen to fail on exactly that, with `ParentNotFoundException` naming the deleted OU and the landing zone left `FAILED`. Check 8 cannot see these, because it asks what is enabled on each OU that *exists*; this one lists every enabled control and checks the target it holds. WARNING rather than blocker: AWS has stated the service-side handling of this case is fixed, so the stale reference is worth clearing but is not a demonstrated hard failure | `controltower:ListEnabledControls` (no target filter) | WARNING |
+| 31 | Foundational OU is not nested | On landing zone 4.0+ Control Tower resolves the foundational OU from where the service-integration accounts sit, then rejects the operation if that OU is nested under another OU instead of sitting directly under the organization root ([4.0 key changes](https://docs.aws.amazon.com/controltower/latest/userguide/key-changes-lz-v4.html)). Check 26 covers the opposite error, those accounts left at the root. Because the rejection happens during input validation the update never starts, so no partial state is left behind - which is why this is a blocker rather than a warning. Skipped when 4.0 is neither deployed nor available, since the requirement arrived with 4.0 | `organizations:ListParents`, `organizations:ListOrganizationalUnitsForParent` | BLOCKER |
 
 **Opt-in deeper checks** (off by default — slower or heuristic; enable with a flag):
 
@@ -170,6 +173,12 @@ If it does not, the tool emits a WARNING (not a blocker).
           "cloudformation:ListStackSets",
           "cloudformation:ListStackInstances",
           "cloudformation:ListStacks",
+          "s3:ListAllMyBuckets",
+          "s3:GetBucketLocation",
+          "s3:GetBucketRequestPayment",
+          "s3:GetBucketObjectLockConfiguration",
+          "s3:GetObjectLockConfiguration",
+          "s3:GetBucketTagging",
           "cloudformation:ListStackSetOperations",
           "sso:ListInstances",
           "account:ListRegions",
@@ -347,7 +356,7 @@ severity fires (e.g. INOPERABLE in a shared account → BLOCKER, DRIFTED → WAR
 UNKNOWN not PASS, a Deny SCP without an `AWSControlTowerExecution` exemption → WARNING).
 
 ```bash
-python3 tests/test_blocker_paths.py      # 240 tests, plain unittest (no extra deps)
+python3 tests/test_blocker_paths.py      # 270 tests, plain unittest (no extra deps)
 ```
 
 This complements a live run against a healthy landing zone (which only exercises the PASS/INFO
@@ -375,6 +384,18 @@ This tool reduces upgrade failures; it does not guarantee success. Be aware of t
   StackSets, AFT account naming) and can produce false negatives for heavily renamed deployments.
 - **Region.** Control Tower is Region-scoped; run in the home Region or checks will not find the
   landing zone.
+- **Service-internal state is invisible to a precheck.** Two failure modes seen repeatedly are
+  not detectable from outside. A landing zone can hold a stale internal operation lock, so an
+  update is rejected with `ConflictException` and *"cannot begin landing zone setup while another
+  execution is in progress"* even when nothing is running and no Step Function is active; only
+  AWS Support can clear it. Control Tower can also fail part-way through its own update because
+  of a race between its internal modules, which no precondition predicts. A landing zone left in
+  `FAILED` state by either is reported by check 1, but the cause is not.
+- **Shared accounts already claimed by another landing zone.** An update can fail validation with
+  *"The account specified for the AWS Config integration is in use for another Control Tower
+  environment"* when a shared account is still registered to a landing zone in a different
+  management account. That association is internal to Control Tower and no public API exposes it,
+  so the check cannot see it.
 - **Commercial partition only.** Member-account role ARNs and the STS endpoint are built for
   the `aws` partition, so the tool does not run in AWS GovCloud (`aws-us-gov`) or China
   (`aws-cn`), even though Control Tower is available in GovCloud. Adapt the ARN and endpoint
