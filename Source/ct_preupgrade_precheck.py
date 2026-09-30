@@ -1777,8 +1777,11 @@ def _latest_major_version(ctx: Context) -> Optional[int]:
         return None
 
 # Trusted (service) access that an operating Control Tower landing zone relies on.
+# The only principal AWS documents as used by Control Tower itself.
+_CT_SERVICE_PRINCIPAL = "controltower.amazonaws.com"
+
 _REQUIRED_TRUSTED_SERVICES = [
-    "controltower.amazonaws.com",
+    _CT_SERVICE_PRINCIPAL,
     "member.org.stacksets.cloudformation.amazonaws.com",
     "config.amazonaws.com",
     "sso.amazonaws.com",
@@ -1786,8 +1789,18 @@ _REQUIRED_TRUSTED_SERVICES = [
 
 
 def check_trusted_access(ctx: Context, report: Report) -> None:
-    """Control Tower relies on trusted (service) access in AWS Organizations. If a required
-    service principal was disabled, updates fail."""
+    """Control Tower relies on trusted (service) access in AWS Organizations.
+
+    Only `controltower.amazonaws.com` is documented as the principal Control Tower itself uses
+    (Organizations, "Service principals used by AWS Control Tower"). Its absence is a named drift
+    type with a documented resolution: governance-drift.html shows the notification carrying
+    DriftType TRUSTED_ACCESS_DISABLED and RemediationStep "Reset Control Tower landing zone", and
+    the Organizations page states that re-enabling trusted access does NOT clear the drift. So the
+    remediation for that one is a landing zone reset, not simply switching the access back on.
+
+    The other principals are required by Control Tower's use of those services rather than by any
+    documented statement, so they are listed but not attributed the same drift consequence.
+    """
     try:
         enabled = {s["ServicePrincipal"] for s in _collect(
             ctx.orgs, "list_aws_service_access_for_organization", "EnabledServicePrincipals")}
@@ -1797,12 +1810,27 @@ def check_trusted_access(ctx: Context, report: Report) -> None:
         return
     missing = [s for s in _REQUIRED_TRUSTED_SERVICES if s not in enabled]
     if missing:
+        ct_access_missing = _CT_SERVICE_PRINCIPAL in missing
+        rows = [[m, "documented Control Tower principal" if m == _CT_SERVICE_PRINCIPAL
+                 else "required by Control Tower's use of this service"] for m in missing]
+        if ct_access_missing:
+            detail = ("Control Tower records this as TRUSTED_ACCESS_DISABLED drift. While trusted "
+                      "access is off, Control Tower stops receiving organizational change events "
+                      "and can miss account and OU changes.")
+            remediation = ("Reset the landing zone - that is the documented resolution for this "
+                           "drift type. Re-enabling trusted access in AWS Organizations does NOT "
+                           "clear the drift on its own, so do not treat a subsequent PASS from "
+                           f"this check as evidence the landing zone is healthy. See {DOC}"
+                           "/governance-drift.html")
+        else:
+            detail = ("Control Tower needs trusted access for these service principals. Unlike "
+                      f"{_CT_SERVICE_PRINCIPAL}, their absence is not a documented drift type.")
+            remediation = ("Re-enable trusted access for the listed service principals, then "
+                           "re-run this check.")
         report.add(Finding("trusted_access", BLOCKER,
                            "Required trusted access is disabled in AWS Organizations",
-                           "Control Tower needs trusted access for these service principals.",
-                           cols=["Missing service principal"], rows=[[m] for m in missing],
-                           remediation="Re-enable trusted access (do not disable CT-managed "
-                                       "trusted access). See the AWS Organizations docs."))
+                           detail, cols=["Missing service principal", "Basis"], rows=rows,
+                           remediation=remediation))
     else:
         report.add(Finding("trusted_access", PASS,
                            "All required trusted service access is enabled"))

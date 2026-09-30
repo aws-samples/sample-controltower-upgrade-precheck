@@ -1321,6 +1321,37 @@ class TestBlockerPaths(unittest.TestCase):
         ctx = make_ctx({"organizations": orgs})
         self.assertIn(ct.BLOCKER, levels(_run(ct.check_trusted_access, ctx)))
 
+    def test_trusted_access_ct_principal_missing_says_reset_not_reenable(self):
+        """governance-drift.html gives RemediationStep "Reset Control Tower landing zone", and the
+        Organizations page states re-enabling does not clear the drift."""
+        orgs = FakeClient({"list_aws_service_access_for_organization": {
+            "EnabledServicePrincipals": [
+                {"ServicePrincipal": "config.amazonaws.com"},
+                {"ServicePrincipal": "sso.amazonaws.com"},
+                {"ServicePrincipal": "member.org.stacksets.cloudformation.amazonaws.com"}]}})
+        rpt = _run(ct.check_trusted_access, make_ctx({"organizations": orgs}))
+        f = [x for x in rpt.findings if x.check == "trusted_access"][0]
+        self.assertEqual(ct.BLOCKER, f.level)
+        self.assertIn("Reset the landing zone", f.remediation)
+        self.assertIn("does NOT", f.remediation)
+        self.assertIn("TRUSTED_ACCESS_DISABLED", f.detail)
+        self.assertIn(["controltower.amazonaws.com",
+                       "documented Control Tower principal"], f.rows)
+
+    def test_trusted_access_other_principal_missing_does_not_claim_drift(self):
+        orgs = FakeClient({"list_aws_service_access_for_organization": {
+            "EnabledServicePrincipals": [
+                {"ServicePrincipal": "controltower.amazonaws.com"},
+                {"ServicePrincipal": "sso.amazonaws.com"},
+                {"ServicePrincipal": "member.org.stacksets.cloudformation.amazonaws.com"}]}})
+        rpt = _run(ct.check_trusted_access, make_ctx({"organizations": orgs}))
+        f = [x for x in rpt.findings if x.check == "trusted_access"][0]
+        self.assertEqual(ct.BLOCKER, f.level)
+        self.assertNotIn("Reset the landing zone", f.remediation)
+        self.assertNotIn("TRUSTED_ACCESS_DISABLED", f.detail)
+        self.assertEqual([["config.amazonaws.com",
+                           "required by Control Tower's use of this service"]], f.rows)
+
     def test_trusted_access_present_passes(self):
         orgs = FakeClient({"list_aws_service_access_for_organization":
                            {"EnabledServicePrincipals":
