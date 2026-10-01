@@ -1290,6 +1290,72 @@ class TestBlockerPaths(unittest.TestCase):
         self.assertNotIn(ct.PASS, lv)
         self.assertNotIn(ct.BLOCKER, lv)
 
+    # Management-account Control Tower stacks (check 8 reads StackSet instances only) ------
+    CT_STACK = "AWSControlTowerBP-BASELINE-CLOUDTRAIL-MASTER"
+    CFG_STACK = "AWSControlTowerBP-BASELINE-CONFIG-MASTER"
+    LOG_ON = {"centralizedLogging": {"enabled": True}}
+
+    def _mgmt_ctx(self, stacks, version="3.3", manifest=None):
+        cfn = FakeClient({"list_stacks": {"StackSummaries": [
+            {"StackName": n, "StackStatus": st} for n, st in stacks.items()]}})
+        return make_ctx({"cloudformation": cfn},
+                        lz={"status": "ACTIVE", "version": version,
+                            "latestAvailableVersion": "4.0",
+                            "driftStatus": {"status": "IN_SYNC"}},
+                        manifest=self.LOG_ON if manifest is None else manifest)
+
+    def test_mgmt_stacks_all_present_passes(self):
+        ctx = self._mgmt_ctx({self.CT_STACK: "UPDATE_COMPLETE",
+                              self.CFG_STACK: "CREATE_COMPLETE"})
+        self.assertEqual({ct.PASS}, levels(_run(ct.check_management_account_stacks, ctx)))
+
+    def test_mgmt_stacks_deleted_out_of_band_warns_and_never_blocks(self):
+        """The reported case: both MASTER stacks deleted by hand in the management account."""
+        rpt = _run(ct.check_management_account_stacks, self._mgmt_ctx({}))
+        lv = levels(rpt)
+        self.assertIn(ct.WARNING, lv)
+        self.assertNotIn(ct.BLOCKER, lv)
+        f = [x for x in rpt.findings if x.check == "mgmt_stacks"][0]
+        self.assertEqual([self.CT_STACK, self.CFG_STACK], sorted(r[0] for r in f.rows))
+        self.assertIn("recreates these", f.remediation)
+
+    def test_mgmt_config_stack_not_expected_on_v4(self):
+        ctx = self._mgmt_ctx({self.CT_STACK: "UPDATE_COMPLETE"}, version="4.0")
+        self.assertEqual({ct.PASS}, levels(_run(ct.check_management_account_stacks, ctx)))
+
+    def test_mgmt_cloudtrail_stack_not_expected_when_logging_disabled(self):
+        ctx = self._mgmt_ctx({}, version="4.0",
+                             manifest={"centralizedLogging": {"enabled": False}})
+        self.assertEqual({ct.INFO}, levels(_run(ct.check_management_account_stacks, ctx)))
+
+    def test_mgmt_stack_rolled_back_warns(self):
+        ctx = self._mgmt_ctx({self.CT_STACK: "UPDATE_ROLLBACK_COMPLETE",
+                              self.CFG_STACK: "CREATE_COMPLETE"})
+        rpt = _run(ct.check_management_account_stacks, ctx)
+        self.assertIn(ct.WARNING, levels(rpt))
+        self.assertNotIn(ct.BLOCKER, levels(rpt))
+        f = [x for x in rpt.findings if x.check == "mgmt_stacks_unhealthy"][0]
+        self.assertEqual([[self.CT_STACK, "UPDATE_ROLLBACK_COMPLETE"]], f.rows)
+
+    def test_mgmt_stack_operation_in_progress_warns(self):
+        ctx = self._mgmt_ctx({self.CT_STACK: "UPDATE_IN_PROGRESS",
+                              self.CFG_STACK: "CREATE_COMPLETE"})
+        rpt = _run(ct.check_management_account_stacks, ctx)
+        self.assertIn(ct.WARNING, levels(rpt))
+        self.assertTrue(any(x.check == "mgmt_stacks_in_progress" for x in rpt.findings))
+
+    def test_mgmt_stacks_deleted_status_ignored(self):
+        ctx = self._mgmt_ctx({self.CT_STACK: "UPDATE_COMPLETE",
+                              self.CFG_STACK: "CREATE_COMPLETE",
+                              "AWSControlTowerBP-OLD": "DELETE_COMPLETE"})
+        self.assertEqual({ct.PASS}, levels(_run(ct.check_management_account_stacks, ctx)))
+
+    def test_mgmt_stacks_unreadable_is_unknown(self):
+        cfn = FakeClient({}, {"list_stacks": client_error("AccessDenied", "ListStacks")})
+        rpt = _run(ct.check_management_account_stacks,
+                   make_ctx({"cloudformation": cfn}, manifest=self.LOG_ON))
+        self.assertEqual({ct.UNKNOWN}, levels(rpt))
+
     def test_render_includes_doc_reference(self):
         rpt = ct.Report()
         rpt.add(ct.Finding("lz_status", ct.BLOCKER, "Landing zone is in a FAILED state"))

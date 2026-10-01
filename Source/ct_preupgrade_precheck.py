@@ -186,6 +186,9 @@ _CHECK_DOCS = {
     "foundational_ou_extra_accounts": f"{DOC}/drift.html",
     "foundational_ou_additional": f"{DOC}/drift.html",
     "governed_regions": f"{DOC}/region-how.html",
+    "mgmt_stacks": f"{DOC}/drift.html",
+    "mgmt_stacks_unhealthy": f"{DOC}/drift.html",
+    "mgmt_stacks_in_progress": f"{DOC}/drift.html",
     "foundational_ou_nested": f"{DOC}/key-changes-lz-v4.html",
     "stacksets": f"{DOC}/drift.html",
     "stacksets_member": f"{DOC}/drift.html",
@@ -2900,6 +2903,109 @@ def check_foundational_ou_not_nested(ctx: Context, report: Report) -> None:
                            "The foundational OU sits directly under the organization root"))
 
 
+# Control Tower creates a small number of CloudFormation stacks DIRECTLY in the management
+# account, rather than through a StackSet. Verified across six landing zones: no AWSControlTower*
+# StackSet targets the management account at all, so check 8 (StackSet health) cannot see these.
+_MGMT_CLOUDTRAIL_STACK = "AWSControlTowerBP-BASELINE-CLOUDTRAIL-MASTER"
+_MGMT_CONFIG_STACK = "AWSControlTowerBP-BASELINE-CONFIG-MASTER"
+_MGMT_STACK_PREFIX = "AWSControlTower"
+# A stack in one of these states is not serving its purpose, whatever the resources inside it say.
+_UNHEALTHY_STACK_STATES = (
+    "CREATE_FAILED", "ROLLBACK_IN_PROGRESS", "ROLLBACK_FAILED", "ROLLBACK_COMPLETE",
+    "DELETE_FAILED", "UPDATE_FAILED", "UPDATE_ROLLBACK_IN_PROGRESS",
+    "UPDATE_ROLLBACK_FAILED", "UPDATE_ROLLBACK_COMPLETE",
+    "IMPORT_ROLLBACK_IN_PROGRESS", "IMPORT_ROLLBACK_FAILED", "IMPORT_ROLLBACK_COMPLETE",
+)
+
+
+def check_management_account_stacks(ctx: Context, report: Report) -> None:
+    """Control Tower's own CloudFormation stacks in the management account.
+
+    Check 8 reads StackSet INSTANCES. Across six landing zones not one AWSControlTower* StackSet
+    targets the management account, so the stacks Control Tower creates there directly are outside
+    its reach. A customer who deletes one out of band gets no signal from the StackSet check.
+
+    Reported as WARNING, never as a blocker: a landing zone update or reset recreates these, so a
+    missing stack is something to tell the customer about rather than a reason to stop.
+
+    Which stacks to expect is derived from observation, not from documentation, so the rules are
+    deliberately narrow and are stated here so a wrong call is visible:
+
+      - The CloudTrail stack is expected when the CentralizedLogging integration is enabled. Seen
+        present on four landing zones with it enabled, and absent on one with it disabled.
+      - The Config stack is expected below landing zone 4.0. Seen present on all three 3.x landing
+        zones and absent on both 4.0 ones, where Config is delivered differently.
+
+    Anything else matching the AWSControlTower prefix is reported on health only, never on absence,
+    because there is no basis for predicting whether it should be there.
+    """
+    try:
+        cfn = ctx.session.client("cloudformation", region_name=ctx.region)
+        stacks = {st["StackName"]: st.get("StackStatus", "")
+                  for st in _collect(cfn, "list_stacks", "StackSummaries")
+                  if st.get("StackName", "").startswith(_MGMT_STACK_PREFIX)
+                  and st.get("StackStatus") != "DELETE_COMPLETE"}
+    except (ClientError, BotoCoreError) as e:
+        report.add(Finding("mgmt_stacks", UNKNOWN,
+                           "Could not list CloudFormation stacks in the management account", str(e),
+                           remediation="Grant cloudformation:ListStacks and re-run."))
+        return
+
+    expected = {}
+    if _integration_enabled(ctx, "centralizedLogging") is True:
+        expected[_MGMT_CLOUDTRAIL_STACK] = "CentralizedLogging integration is enabled"
+    if (_lz_major_version(ctx) or 0) < 4:
+        expected[_MGMT_CONFIG_STACK] = "landing zone is below 4.0"
+
+    missing = [[n, why] for n, why in sorted(expected.items()) if n not in stacks]
+    unhealthy = [[n, st] for n, st in sorted(stacks.items()) if st in _UNHEALTHY_STACK_STATES]
+    in_progress = [[n, st] for n, st in sorted(stacks.items()) if st.endswith("_IN_PROGRESS")
+                   and st not in _UNHEALTHY_STACK_STATES]
+
+    if missing:
+        report.add(Finding("mgmt_stacks", WARNING,
+                           f"{len(missing)} Control Tower stack(s) missing from the management account",
+                           "Control Tower created these directly in the management account, not "
+                           "through a StackSet, so check 8 cannot see them. They are most often "
+                           "absent because someone removed them out of band. A landing zone update "
+                           "or reset recreates them, so this does not block the upgrade - but the "
+                           "customer should know the environment is not in the state Control Tower "
+                           "last left it, and that the upgrade will restore it.",
+                           cols=["Missing stack", "Expected because"], rows=missing,
+                           remediation="No action needed before upgrading; the update or reset "
+                                       "recreates these. If you would rather restore them first, "
+                                       "repair or reset the landing zone."))
+    if unhealthy:
+        report.add(Finding("mgmt_stacks_unhealthy", WARNING,
+                           f"{len(unhealthy)} Control Tower stack(s) in the management account are "
+                           "in a failed or rolled-back state",
+                           "A rolled-back or failed stack is not serving its purpose regardless of "
+                           "what the resources inside it report. An update reasserts Control "
+                           "Tower's intent over these, so this is worth resolving but does not "
+                           "block the upgrade.",
+                           cols=["Stack", "Status"], rows=unhealthy,
+                           remediation="Review the stack events for the failure, then repair or "
+                                       "reset the landing zone to have Control Tower reassert it."))
+    if in_progress:
+        report.add(Finding("mgmt_stacks_in_progress", WARNING,
+                           f"{len(in_progress)} Control Tower stack(s) in the management account "
+                           "have an operation in progress",
+                           "A stack operation is still running. Starting a landing zone update "
+                           "while Control Tower's own stacks are mid-operation risks the two "
+                           "colliding.",
+                           cols=["Stack", "Status"], rows=in_progress,
+                           remediation="Wait for the stack operation to finish."))
+    if not missing and not unhealthy and not in_progress:
+        if stacks:
+            report.add(Finding("mgmt_stacks", PASS,
+                               f"{len(stacks)} Control Tower stack(s) in the management account are "
+                               "healthy, and every expected stack is present"))
+        else:
+            report.add(Finding("mgmt_stacks", INFO,
+                               "No Control Tower stacks found in the management account, and none "
+                               "are expected for this landing zone version and configuration"))
+
+
 def check_governed_region_availability(ctx: Context, report: Report) -> None:
     """Every governed Region must be usable by this account.
 
@@ -3591,6 +3697,7 @@ CHECKS = [
     check_stale_control_targets,
     check_foundational_ou_structure,
     check_governed_region_availability,
+    check_management_account_stacks,
     check_foundational_ou_not_nested,
     check_stacksets,
     check_expected_stacksets,
