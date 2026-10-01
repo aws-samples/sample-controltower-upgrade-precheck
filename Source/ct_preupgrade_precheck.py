@@ -2965,12 +2965,11 @@ def check_management_account_stacks(ctx: Context, report: Report) -> None:
     if missing:
         report.add(Finding("mgmt_stacks", WARNING,
                            f"{len(missing)} Control Tower stack(s) missing from the management account",
-                           "Control Tower created these directly in the management account, not "
-                           "through a StackSet, so check 8 cannot see them. They are most often "
-                           "absent because someone removed them out of band. A landing zone update "
-                           "or reset recreates them, so this does not block the upgrade - but the "
-                           "customer should know the environment is not in the state Control Tower "
-                           "last left it, and that the upgrade will restore it.",
+                           "Control Tower created these stacks in the management account, and they "
+                           "are most often absent because they were removed out of band. A landing "
+                           "zone update or reset recreates them, so this does not block the "
+                           "upgrade. It does mean the environment is not in the state Control "
+                           "Tower last left it, and that the upgrade will change that.",
                            cols=["Missing stack", "Expected because"], rows=missing,
                            remediation="No action needed before upgrading; the update or reset "
                                        "recreates these. If you would rather restore them first, "
